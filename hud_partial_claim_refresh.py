@@ -180,17 +180,26 @@ def fetch_hud_partial_claim_document_ids() -> list:
 
 
 def fetch_master_info(document_ids: list) -> dict:
-    """document_id -> {doc_type, doc_amount, recorded_datetime}."""
+    """document_id -> {doc_type, doc_amount, recorded_datetime}.
+
+    NYC's real column name for the dollar amount on this dataset is
+    "document_amt", not "doc_amount" — confirmed by querying the live
+    dataset directly (asking for "doc_amount" gets a
+    query.soql.no-such-column error). We ask for the real name, then
+    rename it to "doc_amount" right away so nothing downstream has to
+    change.
+    """
     info = {}
     for batch in chunked(document_ids, BATCH_SIZE):
         id_list = ",".join(f"'{d}'" for d in batch)
         rows = get_json(MASTER_DATASET, {
-            "$select": "document_id, doc_type, doc_amount, recorded_datetime",
+            "$select": "document_id, doc_type, document_amt, recorded_datetime",
             "$where": f"document_id in ({id_list})",
             "$limit": BATCH_SIZE,
         })
         for row in rows:
             if row.get("doc_type") in RELEVANT_DOC_TYPES:
+                row["doc_amount"] = row.pop("document_amt", "")
                 info[row["document_id"]] = row
         time.sleep(REQUEST_PAUSE_SEC)
     return info
