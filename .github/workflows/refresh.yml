@@ -1,0 +1,44 @@
+# Runs hud_partial_claim_refresh.py automatically, once a day, in GitHub's
+# free cloud — no computer of yours needs to be on for this to happen.
+# It saves the fresh hud_partial_claims.json / .csv back into this same
+# repository, which is what hud-search.html reads.
+#
+# You can also trigger it manually any time from the "Actions" tab on
+# GitHub (a "Run workflow" button appears once this file is added) —
+# useful for testing right after setup instead of waiting for the clock.
+
+name: Refresh HUD Partial Claims
+
+on:
+  schedule:
+    # 10:00 UTC = 6am Eastern (5am during Daylight Saving). Change the
+    # first number pair if you want it to run at a different hour.
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run the refresh script
+        run: python3 hud_partial_claim_refresh.py
+
+      - name: Save the updated files back to this repository
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Daily HUD Partial Claim refresh"
+          file_pattern: "hud_partial_claims.json hud_partial_claims.csv seen_ids_hud_partial_claim.json"
