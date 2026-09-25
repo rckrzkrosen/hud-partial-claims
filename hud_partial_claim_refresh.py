@@ -92,7 +92,13 @@ CSV_OUTPUT_PATH = STATE_DIR / "hud_partial_claims.csv"
 
 PAGE_SIZE = 1000
 REQUEST_PAUSE_SEC = 0.2
-BATCH_SIZE = 200  # keep $where ... in (...) URLs a sane length
+# How many document_ids go into one "in (...)" lookup. NYC's server 400s on
+# a web address that gets too long. 200 at a time was too many (several
+# thousand characters); POSTing instead avoided the length problem but NYC's
+# server turned out to require a login for POST requests specifically, which
+# is worse. 40 at a time keeps the plain web address short enough to always
+# be accepted, with no login needed — just more, smaller requests instead.
+BATCH_SIZE = 40
 
 
 def get_json(dataset: str, params: dict, max_retries: int = 5) -> list:
@@ -104,17 +110,11 @@ def get_json(dataset: str, params: dict, max_retries: int = 5) -> list:
     and if a request still fails, it tries again a few times (5s, 10s,
     20s... between tries) before giving up on that one page.
     """
-    # IMPORTANT: use POST with the query as form data, not GET with a query
-    # string. The batch lookups below ("document_id in (...)") pack 200 IDs
-    # into one query — as a GET, that makes a URL several thousand characters
-    # long, and NYC's server rejects those with a blunt "400 Bad Request"
-    # that doesn't explain why. Socrata accepts the exact same parameters as
-    # POST form fields instead, which sidesteps the URL-length limit entirely.
-    url = f"{SOCRATA_BASE}/{dataset}.json"
+    url = f"{SOCRATA_BASE}/{dataset}.json?{urlencode(params)}"
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(url, data=params, timeout=90)
+            resp = requests.get(url, timeout=90)
             resp.raise_for_status()
             return resp.json()
         except (requests.exceptions.Timeout,
