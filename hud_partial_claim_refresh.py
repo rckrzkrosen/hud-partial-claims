@@ -27,10 +27,30 @@ a street address and zip code.
 
 DATA SOURCES — NYC Open Data / Socrata, all public, no key required
 ----------------------------------------------------------------------
-  ACRIS - Real Property Parties : 636b-3b5g  (who's the lender)
+  ACRIS - Real Property Parties : 636b-3b5g  (who's the lender, and
+                                                who's the borrower — same
+                                                dataset, party_type '1'
+                                                vs '2')
   ACRIS - Real Property Master  : bnx9-e6tj  (the document itself)
   ACRIS - Real Property Legals  : 8h5j-fqxa  (which property, block/lot)
   PLUTO (property database)     : 64uk-42ks  (block/lot -> zip code)
+
+OWNER NAME + ABSENTEE-OWNER FLAG (added Sept 2026)
+----------------------------------------------------------------------
+The same Real Property Parties dataset already being queried for "who's
+the lender" also has a row for "who's the borrower" (party_type '1'),
+and that row includes the borrower's own mailing address — confirmed
+live: for document 2026082600319001, the party_type '1' row is
+"MGBEME, LYNNE" at "10921 SPRINGFIELD BLVD, QUEENS VILLAGE, NY 11429",
+matching the property's own address exactly.
+
+So for every HUD Partial Claim record, this script now also pulls the
+borrower's name and mailing zip code, and compares that mailing zip to
+the property's own zip code (from PLUTO). A mismatch means the mail for
+this loan doesn't go to the property itself — the classic sign of an
+absentee/out-of-town landlord rather than an owner-occupant. This adds
+no new dataset and no new daily job — it's one more thing read off data
+already being fetched.
 
 USAGE
 -----
@@ -205,6 +225,30 @@ def fetch_master_info(document_ids: list) -> dict:
     return info
 
 
+def fetch_borrower_info(document_ids: list) -> dict:
+    """document_id -> {name, zip, city, state} for the borrower (party_type '1').
+
+    A document can have more than one party_type '1' row (co-borrowers).
+    We keep the first one — for the absentee-owner comparison, that's
+    plenty: if the primary borrower's mail doesn't go to the property,
+    that's the signal we care about.
+    """
+    info = {}
+    for batch in chunked(document_ids, BATCH_SIZE):
+        id_list = ",".join(f"'{d}'" for d in batch)
+        rows = get_json(PARTIES_DATASET, {
+            "$select": "document_id, name, zip, city, state",
+            "$where": f"document_id in ({id_list}) AND party_type = '1'",
+            "$limit": BATCH_SIZE * 2,
+        })
+        for row in rows:
+            doc_id = row["document_id"]
+            if doc_id not in info:
+                info[doc_id] = row
+        time.sleep(REQUEST_PAUSE_SEC)
+    return info
+
+
 def fetch_legals_info(document_ids: list) -> dict:
     """document_id -> list of {borough, block, lot, street_number, street_name, unit}."""
     info = {}
@@ -247,7 +291,7 @@ def fetch_zip_codes(bbls: list) -> dict:
     return info
 
 
-def build_rows(master_info: dict, legals_info: dict) -> list:
+def build_rows(master_info: dict, legals_info: dict, borrower_info: dict) -> list:
     rows = []
     all_bbls = []
     prelim = []
@@ -268,16 +312,36 @@ def build_rows(master_info: dict, legals_info: dict) -> list:
         address = " ".join(p for p in [street_num, street_name] if p)
         if unit:
             address = f"{address}, Unit {unit}"
+
+        property_zip = zip_lookup.get(bbl, "")
+        borrower = borrower_info.get(doc_id, {})
+        owner_name = (borrower.get("name") or "").strip()
+        owner_zip = (borrower.get("zip") or "").strip()[:5]
+        owner_city = (borrower.get("city") or "").strip()
+        owner_state = (borrower.get("state") or "").strip()
+
+        # Absentee = the borrower's own mail doesn't go to this property.
+        # Only call it when we actually have both zips to compare — an
+        # unknown mailing address is not the same as a confirmed mismatch.
+        absentee_owner = bool(
+            property_zip and owner_zip and property_zip[:5] != owner_zip
+        )
+
         rows.append({
             "document_id": doc_id,
             "borough": BOROUGH_CODE_TO_NAME.get(borough_code, borough_code),
             "block": legal.get("block", ""),
             "lot": legal.get("lot", ""),
-            "zip": zip_lookup.get(bbl, ""),
+            "zip": property_zip,
             "address": address,
             "recorded_date": (master.get("recorded_datetime") or "")[:10],
             "doc_amount": master.get("doc_amount", ""),
             "doc_type": master.get("doc_type", ""),
+            "owner_name": owner_name,
+            "owner_mailing_city_state": (
+                ", ".join(p for p in [owner_city, owner_state] if p)
+            ),
+            "absentee_owner": absentee_owner,
         })
     return rows
 
@@ -302,7 +366,8 @@ def write_outputs(rows: list) -> None:
     }, indent=2))
 
     fieldnames = ["document_id", "borough", "zip", "block", "lot", "address",
-                  "recorded_date", "doc_amount", "doc_type"]
+                  "recorded_date", "doc_amount", "doc_type", "owner_name",
+                  "owner_mailing_city_state", "absentee_owner"]
     with open(CSV_OUTPUT_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -351,20 +416,26 @@ def send_email(new_rows: list) -> None:
 def main():
     print("HUD Partial Claim Refresh — NYC (5 boroughs)\n")
 
-    print("Step 1/4: finding HUD as lender in ACRIS Real Property Parties...")
+    print("Step 1/5: finding HUD as lender in ACRIS Real Property Parties...")
     all_ids = fetch_hud_partial_claim_document_ids()
     print(f"  {len(all_ids)} document_ids found.\n")
 
-    print("Step 2/4: pulling document details (type, amount, recorded date)...")
+    print("Step 2/5: pulling document details (type, amount, recorded date)...")
     master_info = fetch_master_info(all_ids)
     print(f"  {len(master_info)} are mortgage-family documents.\n")
 
-    print("Step 3/4: resolving addresses and zip codes...")
+    print("Step 3/5: resolving addresses and zip codes...")
     legals_info = fetch_legals_info(list(master_info.keys()))
-    all_rows = build_rows(master_info, legals_info)
-    print(f"  {len(all_rows)} property rows built.\n")
 
-    print("Step 4/4: writing output files and checking what's new...")
+    print("Step 4/5: pulling borrower name + mailing address "
+          "(for the absentee-owner flag)...")
+    borrower_info = fetch_borrower_info(list(master_info.keys()))
+    all_rows = build_rows(master_info, legals_info, borrower_info)
+    absentee_count = sum(1 for r in all_rows if r["absentee_owner"])
+    print(f"  {len(all_rows)} property rows built "
+          f"({absentee_count} flagged absentee-owner).\n")
+
+    print("Step 5/5: writing output files and checking what's new...")
     write_outputs(all_rows)
     print(f"  Wrote {JSON_OUTPUT_PATH.name} and {CSV_OUTPUT_PATH.name} "
           f"({len(all_rows)} rows).")
